@@ -43,14 +43,19 @@ def render_all(image_bgr: np.ndarray, label_map: np.ndarray,
     return outline_path, color_ref_path, palette_path, pdf_path
 
 
-def _find_boundaries(label_map: np.ndarray) -> np.ndarray:
-    """Find region boundaries using neighbor comparison."""
+def _find_boundaries(label_map: np.ndarray, thickness: int = 2) -> np.ndarray:
+    """Find region boundaries using neighbor comparison with controllable thickness."""
     h, w = label_map.shape
     boundary = np.zeros((h, w), dtype=bool)
     boundary[:-1, :] |= label_map[:-1, :] != label_map[1:, :]
     boundary[1:, :] |= label_map[:-1, :] != label_map[1:, :]
     boundary[:, :-1] |= label_map[:, :-1] != label_map[:, 1:]
     boundary[:, 1:] |= label_map[:, :-1] != label_map[:, 1:]
+
+    if thickness > 1:
+        kernel = np.ones((thickness, thickness), dtype=np.uint8)
+        boundary = cv2.dilate(boundary.astype(np.uint8), kernel).astype(bool)
+
     return boundary
 
 

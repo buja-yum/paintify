@@ -18,10 +18,10 @@ from renderer import render_all
 
 
 DIFFICULTY_SEGMENTS = {
-    "easy": 350,
-    "medium": 700,
-    "hard": 1400,
-    "expert": 2000,
+    "easy": 500,
+    "medium": 1000,
+    "hard": 1800,
+    "expert": 2800,
 }
 
 
