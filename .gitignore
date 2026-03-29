@@ -23,7 +23,7 @@ Thumbs.db
 desktop.ini
 
 # Project
-input/
-output/
+input*/
+output*/
 *.ARW
 *.arw

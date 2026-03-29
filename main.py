@@ -33,8 +33,8 @@ def parse_args():
     parser.add_argument("--difficulty", default="medium",
                         choices=["easy", "medium", "hard", "expert"],
                         help="Difficulty level (default: medium)")
-    parser.add_argument("--colors", type=int, default=24,
-                        help="Number of palette colors, 24-30 (default: 24)")
+    parser.add_argument("--colors", type=int, default=30,
+                        help="Number of palette colors, 24-30 (default: 30)")
     parser.add_argument("--output", default="./output",
                         help="Output directory (default: ./output)")
     parser.add_argument("--max-dimension", type=int, default=2400,
