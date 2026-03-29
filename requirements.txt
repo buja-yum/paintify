@@ -1,0 +1,7 @@
+opencv-python>=4.8
+scikit-image>=0.22
+numpy>=1.24
+Pillow>=10.0
+matplotlib>=3.7
+reportlab>=4.0
+rawpy>=0.20
