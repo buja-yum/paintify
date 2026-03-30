@@ -208,9 +208,10 @@ def main():
 
     # Step 4: Render outputs
     print("[4/4] Rendering outputs...")
+    output_name = f"{input_name}_{args.difficulty}"
     outline, color_ref, palette_chart, pdf = render_all(
         image, label_map, palette_rgb, region_to_color,
-        args.output, input_name, args.paper_size
+        args.output, output_name, args.paper_size
     )
 
     print()
