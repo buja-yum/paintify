@@ -1,75 +1,140 @@
-"""Color palette extraction with luminance balance and perceptual dedup.
+"""Semantic-aware color palette extraction.
 
-Palette rules (from prompts):
-  - 24-30 colors
-  - Maintain highlight / midtone / shadow balance
-  - Ensure perceptual distinction between all colors
-  - Avoid redundant near-identical colors
-  - Colors must be easy to differentiate when painting
+Design principles (from 11_color_priority.md):
+  Priority: semantic importance > visual saliency > hue distinctiveness > tonal range > area
+  - Subject colors preserved first, background simplified
+  - Accent colors (high saturation, distinctive hue) MUST be kept even if small area
+  - Neutrals limited: don't let grays/whites dominate the palette
+  - Each hue family gets tonal spread (highlight/midtone/shadow)
+  - Perceptual dedup: LAB distance, not RGB
 """
 
 import cv2
 import numpy as np
 
+TIER_BG = 0
+TIER_SECONDARY = 1
+TIER_SUBJECT = 2
+
+# Neutral = low saturation in HSV
+NEUTRAL_SAT_THRESHOLD = 35
+# Max percentage of palette that neutrals can occupy
+NEUTRAL_MAX_RATIO = 0.35
+
 
 def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
-                    n_colors: int) -> tuple:
-    """Extract a color palette and map regions to palette colors.
+                    n_colors: int, region_tiers: dict = None) -> tuple:
+    """Extract a semantically-prioritized color palette.
 
     Returns:
-        palette_rgb: np.ndarray of shape (n_colors, 3), dtype uint8, sorted by hue
+        palette_rgb: np.ndarray of shape (n_colors, 3), dtype uint8
         region_to_color: dict mapping region label -> 1-based palette index
         palette_lab: np.ndarray of shape (n_colors, 3), float64
     """
-    # Stage 1: Per-region mean colors in LAB
+    # Stage 1: Per-region color statistics
     image_lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    image_hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
     unique_labels = np.unique(label_map)
 
-    region_colors = []
+    region_colors_lab = []  # LAB mean
+    region_colors_hsv = []  # HSV mean (for saturation/hue analysis)
     region_areas = []
     region_ids = []
 
     flat_lab = image_lab.reshape(-1, 3)
+    flat_hsv = image_hsv.reshape(-1, 3)
     flat_labels = label_map.ravel()
 
     for lab in unique_labels:
         mask = flat_labels == lab
-        mean_color = flat_lab[mask].mean(axis=0)
-        area = int(mask.sum())
-        region_colors.append(mean_color)
-        region_areas.append(area)
+        region_colors_lab.append(flat_lab[mask].mean(axis=0))
+        region_colors_hsv.append(flat_hsv[mask].mean(axis=0))
+        region_areas.append(int(mask.sum()))
         region_ids.append(lab)
 
-    region_colors = np.array(region_colors, dtype=np.float32)
+    region_colors_lab = np.array(region_colors_lab, dtype=np.float32)
+    region_colors_hsv = np.array(region_colors_hsv, dtype=np.float32)
     region_areas = np.array(region_areas, dtype=np.float32)
 
-    # Stage 2: K-Means clustering weighted by area
-    max_repeats = 10
-    norm_areas = (region_areas / region_areas.max() * max_repeats).astype(int)
-    norm_areas = np.clip(norm_areas, 1, max_repeats)
+    # Stage 2: Classify each region as accent vs neutral
+    saturations = region_colors_hsv[:, 1]  # S channel (0-255)
+    is_accent = saturations > NEUTRAL_SAT_THRESHOLD
 
-    samples = []
-    for color, repeats in zip(region_colors, norm_areas):
-        for _ in range(repeats):
-            samples.append(color)
-    samples = np.array(samples, dtype=np.float32)
+    # Stage 3: Compute semantic weight per region
+    # Subject regions get 3x weight, secondary 1.5x, background 1x
+    # Accents get additional 2x boost
+    weights = np.ones(len(region_ids), dtype=np.float32)
+    if region_tiers:
+        for i, rid in enumerate(region_ids):
+            tier = region_tiers.get(rid, TIER_BG)
+            if tier == TIER_SUBJECT:
+                weights[i] = 3.0
+            elif tier == TIER_SECONDARY:
+                weights[i] = 1.5
+    # Accent boost
+    weights[is_accent] *= 2.0
 
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 0.5)
-    _, _, centers = cv2.kmeans(
-        samples, n_colors, None, criteria, 10, cv2.KMEANS_PP_CENTERS
-    )
+    # Stage 4: Split into accent and neutral groups
+    accent_mask = is_accent
+    neutral_mask = ~is_accent
 
-    palette_lab = centers.astype(np.float64)
+    accent_colors = region_colors_lab[accent_mask]
+    accent_weights = weights[accent_mask] * region_areas[accent_mask]
+    accent_ids = [region_ids[i] for i in range(len(region_ids)) if accent_mask[i]]
 
-    # Stage 3: Deduplicate similar palette colors
+    neutral_colors = region_colors_lab[neutral_mask]
+    neutral_weights = weights[neutral_mask] * region_areas[neutral_mask]
+    neutral_ids = [region_ids[i] for i in range(len(region_ids)) if neutral_mask[i]]
+
+    # Stage 5: Allocate palette slots
+    # Accents get at least 60% if they exist, neutrals capped at NEUTRAL_MAX_RATIO
+    n_accent_regions = len(accent_colors)
+    n_neutral_regions = len(neutral_colors)
+
+    if n_accent_regions > 0 and n_neutral_regions > 0:
+        max_neutral_slots = max(3, int(n_colors * NEUTRAL_MAX_RATIO))
+        n_accent_slots = n_colors - max_neutral_slots
+        # But don't allocate more accent slots than accent regions
+        n_accent_slots = min(n_accent_slots, max(n_accent_regions, n_colors - 3))
+        n_neutral_slots = n_colors - n_accent_slots
+    elif n_accent_regions > 0:
+        n_accent_slots = n_colors
+        n_neutral_slots = 0
+    else:
+        n_accent_slots = 0
+        n_neutral_slots = n_colors
+
+    # Stage 6: K-means within each group
+    palette_parts = []
+
+    if n_accent_slots > 0 and len(accent_colors) > 0:
+        actual_accent = min(n_accent_slots, len(accent_colors))
+        accent_palette = _weighted_kmeans(accent_colors, accent_weights, actual_accent)
+        palette_parts.append(accent_palette)
+        # If we got fewer than allocated, give remainder to neutrals
+        n_neutral_slots += (n_accent_slots - actual_accent)
+
+    if n_neutral_slots > 0 and len(neutral_colors) > 0:
+        actual_neutral = min(n_neutral_slots, len(neutral_colors))
+        neutral_palette = _weighted_kmeans(neutral_colors, neutral_weights, actual_neutral)
+        palette_parts.append(neutral_palette)
+
+    if palette_parts:
+        palette_lab = np.vstack(palette_parts)
+    else:
+        # Fallback: shouldn't happen, but just in case
+        palette_lab = _weighted_kmeans(region_colors_lab,
+                                       weights * region_areas, n_colors)
+
+    # Stage 7: Deduplicate
     palette_lab = _deduplicate_palette(palette_lab, min_delta=5.0)
 
-    # Stage 4: Luminance balance check - ensure highlight/midtone/shadow coverage
-    palette_lab = _ensure_luminance_balance(palette_lab, region_colors, region_areas)
+    # Stage 8: Luminance balance check
+    palette_lab = _ensure_luminance_balance(palette_lab, region_colors_lab, region_areas)
 
-    n_colors = len(palette_lab)
+    n_final = len(palette_lab)
 
-    # Stage 5: Sort palette by hue
+    # Stage 9: Sort by hue (chromatic first, then achromatic)
     palette_lab_uint8 = np.clip(palette_lab, 0, 255).astype(np.uint8).reshape(1, -1, 3)
     palette_bgr = cv2.cvtColor(palette_lab_uint8, cv2.COLOR_LAB2BGR)
     palette_hsv = cv2.cvtColor(palette_bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3)
@@ -85,9 +150,9 @@ def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
     palette_lab = palette_lab[sort_order]
     palette_rgb = palette_rgb_arr[sort_order]
 
-    # Stage 6: Map each region to nearest palette color (1-based index)
+    # Stage 10: Map each region to nearest palette color
     region_to_color = {}
-    for i, (rid, rc) in enumerate(zip(region_ids, region_colors)):
+    for i, (rid, rc) in enumerate(zip(region_ids, region_colors_lab)):
         dists = np.sqrt(np.sum((palette_lab - rc.astype(np.float64)) ** 2, axis=1))
         best_idx = int(np.argmin(dists)) + 1
         region_to_color[rid] = best_idx
@@ -95,8 +160,32 @@ def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
     return palette_rgb.astype(np.uint8), region_to_color, palette_lab
 
 
+def _weighted_kmeans(colors: np.ndarray, weights: np.ndarray, k: int) -> np.ndarray:
+    """K-means clustering with sample weights via repetition."""
+    if len(colors) <= k:
+        return colors.astype(np.float64)
+
+    # Normalize weights to repeat counts
+    max_repeats = 15
+    w_norm = weights / (weights.max() + 1e-8)
+    repeats = np.clip((w_norm * max_repeats).astype(int), 1, max_repeats)
+
+    samples = []
+    for color, r in zip(colors, repeats):
+        for _ in range(r):
+            samples.append(color)
+    samples = np.array(samples, dtype=np.float32)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 0.5)
+    _, _, centers = cv2.kmeans(
+        samples, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS
+    )
+
+    return centers.astype(np.float64)
+
+
 def _deduplicate_palette(palette_lab: np.ndarray, min_delta: float) -> np.ndarray:
-    """Remove near-duplicate palette colors (perceptually too similar)."""
+    """Remove near-duplicate palette colors (perceptually too similar in LAB)."""
     keep = list(range(len(palette_lab)))
 
     while True:
@@ -120,20 +209,9 @@ def _deduplicate_palette(palette_lab: np.ndarray, min_delta: float) -> np.ndarra
     return palette_lab[keep]
 
 
-def _ensure_luminance_balance(palette_lab: np.ndarray,
-                              region_colors: np.ndarray,
-                              region_areas: np.ndarray) -> np.ndarray:
-    """Ensure the palette covers highlight, midtone, and shadow luminance bands.
-
-    LAB L channel: 0 = black, 100 = white (stored as 0-255 in OpenCV LAB)
-    Highlights: L > 170  (~67% brightness)
-    Midtones:   L 85-170 (~33-67%)
-    Shadows:    L < 85   (~0-33%)
-
-    If any band is missing, find the best representative from region colors
-    and add it to the palette.
-    """
-    L_values = palette_lab[:, 0]  # L channel
+def _ensure_luminance_balance(palette_lab, region_colors, region_areas):
+    """Ensure palette covers highlight/midtone/shadow bands."""
+    L_values = palette_lab[:, 0]
 
     has_highlight = np.any(L_values > 170)
     has_midtone = np.any((L_values >= 85) & (L_values <= 170))
@@ -142,29 +220,24 @@ def _ensure_luminance_balance(palette_lab: np.ndarray,
     additions = []
 
     if not has_highlight:
-        # Find brightest region color
         bright = region_colors[region_colors[:, 0] > 170]
         if len(bright) > 0:
-            # Pick the one with largest total area
             bright_mask = region_colors[:, 0] > 170
-            areas_bright = region_areas[bright_mask]
-            best = bright[np.argmax(areas_bright)]
+            best = bright[np.argmax(region_areas[bright_mask])]
             additions.append(best.astype(np.float64))
 
     if not has_midtone:
-        mid = region_colors[(region_colors[:, 0] >= 85) & (region_colors[:, 0] <= 170)]
+        mid_mask = (region_colors[:, 0] >= 85) & (region_colors[:, 0] <= 170)
+        mid = region_colors[mid_mask]
         if len(mid) > 0:
-            mid_mask = (region_colors[:, 0] >= 85) & (region_colors[:, 0] <= 170)
-            areas_mid = region_areas[mid_mask]
-            best = mid[np.argmax(areas_mid)]
+            best = mid[np.argmax(region_areas[mid_mask])]
             additions.append(best.astype(np.float64))
 
     if not has_shadow:
-        dark = region_colors[region_colors[:, 0] < 85]
+        dark_mask = region_colors[:, 0] < 85
+        dark = region_colors[dark_mask]
         if len(dark) > 0:
-            dark_mask = region_colors[:, 0] < 85
-            areas_dark = region_areas[dark_mask]
-            best = dark[np.argmax(areas_dark)]
+            best = dark[np.argmax(region_areas[dark_mask])]
             additions.append(best.astype(np.float64))
 
     if additions:

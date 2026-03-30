@@ -153,7 +153,7 @@ def validate_result(label_map: np.ndarray, difficulty: str,
 def main():
     args = parse_args()
 
-    colors = max(24, min(30, args.colors))
+    colors = max(24, min(150, args.colors))
     n_segments = args.segment_count or DIFFICULTY_SEGMENTS[args.difficulty]
     input_name = os.path.splitext(os.path.basename(args.input))[0]
 
@@ -173,12 +173,13 @@ def main():
 
     # Step 2: Segment (with auto-retry on critical failure)
     label_map = None
+    region_tiers = None
     current_segments = n_segments
 
     for attempt in range(1, MAX_RETRIES + 2):
         print(f"[2/4] Segmenting image (attempt {attempt})...")
         t0 = time.time()
-        label_map = segment_image(image, current_segments, args.difficulty)
+        label_map, region_tiers = segment_image(image, current_segments, args.difficulty)
         t1 = time.time()
         print(f"  Segmentation done in {t1 - t0:.1f}s")
 
@@ -202,7 +203,7 @@ def main():
 
     # Step 3: Extract palette
     print("[3/4] Extracting color palette...")
-    palette_rgb, region_to_color, _ = extract_palette(image, label_map, colors)
+    palette_rgb, region_to_color, _ = extract_palette(image, label_map, colors, region_tiers)
     print(f"  Palette: {len(palette_rgb)} colors")
 
     # Step 4: Render outputs

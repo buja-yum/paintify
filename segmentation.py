@@ -114,7 +114,19 @@ def segment_image(image_bgr: np.ndarray, n_segments: int, difficulty: str) -> np
         print(f"      → {len(areas)} regions")
 
     label_map = _relabel_sequential(label_map)
-    return label_map
+
+    # Rebuild region_tiers for the relabeled map
+    final_tiers = {}
+    # Map old region_tiers to new sequential labels
+    old_labels = np.unique(label_map)
+    # region_tiers still uses pre-relabel IDs, but _relabel_sequential
+    # created a new map. We need tier_map to reclassify.
+    for lab in np.unique(label_map):
+        pixels = tier_map[label_map == lab]
+        counts = np.bincount(pixels, minlength=3)
+        final_tiers[int(lab)] = int(np.argmax(counts))
+
+    return label_map, final_tiers
 
 
 # =============================================================================
