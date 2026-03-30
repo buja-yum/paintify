@@ -235,9 +235,9 @@ def _texture_aware_smooth(image_lab, tier_map):
     # Secondary: moderate smoothing
     sec_smoothed = cv2.bilateralFilter(image_lab, d=9, sigmaColor=45, sigmaSpace=45)
 
-    # Subject: light edge-preserving smoothing to keep texture detail
-    # Use small bilateral that preserves edges (fur boundaries, facial features)
-    subj_smoothed = cv2.bilateralFilter(image_lab, d=5, sigmaColor=25, sigmaSpace=25)
+    # Subject: minimal smoothing to preserve subtle gradients (lighting, shading)
+    # Critical: do NOT destroy brightness variation within same-color fur/skin
+    subj_smoothed = cv2.bilateralFilter(image_lab, d=3, sigmaColor=15, sigmaSpace=15)
 
     # Blend per tier
     bg_3d = np.stack([bg_mask] * 3, axis=-1)
@@ -421,29 +421,33 @@ def _classify_regions(label_map, tier_map):
 def _get_tier_params(difficulty):
     """Per-tier merge parameters.
 
-    Key design: background has VERY high similar_threshold for aggressive simplification.
-    Subject has very low threshold to preserve detail.
+    Key design:
+      - background: high similar_threshold for aggressive simplification
+      - subject: very low threshold to preserve detail
+      - lightness_protect: minimum L-channel difference that blocks merging,
+        even if overall LAB distance is below threshold. This preserves
+        highlight/midtone/shadow transitions within same-hue areas (e.g. white fur).
     """
     params = {
         "easy": {
-            TIER_SUBJECT:   {"min_area_pct": 0.0005, "similar_threshold": 8,  "edge_protect": 0.30},
-            TIER_SECONDARY: {"min_area_pct": 0.0010, "similar_threshold": 14, "edge_protect": 0.22},
-            TIER_BG:        {"min_area_pct": 0.0025, "similar_threshold": 30, "edge_protect": 0.12},
+            TIER_SUBJECT:   {"min_area_pct": 0.0005, "similar_threshold": 8,  "edge_protect": 0.30, "lightness_protect": 6},
+            TIER_SECONDARY: {"min_area_pct": 0.0010, "similar_threshold": 14, "edge_protect": 0.22, "lightness_protect": 8},
+            TIER_BG:        {"min_area_pct": 0.0025, "similar_threshold": 30, "edge_protect": 0.12, "lightness_protect": 15},
         },
         "medium": {
-            TIER_SUBJECT:   {"min_area_pct": 0.0003, "similar_threshold": 6,  "edge_protect": 0.28},
-            TIER_SECONDARY: {"min_area_pct": 0.0006, "similar_threshold": 10, "edge_protect": 0.20},
-            TIER_BG:        {"min_area_pct": 0.0018, "similar_threshold": 25, "edge_protect": 0.10},
+            TIER_SUBJECT:   {"min_area_pct": 0.0003, "similar_threshold": 6,  "edge_protect": 0.28, "lightness_protect": 4},
+            TIER_SECONDARY: {"min_area_pct": 0.0006, "similar_threshold": 10, "edge_protect": 0.20, "lightness_protect": 6},
+            TIER_BG:        {"min_area_pct": 0.0018, "similar_threshold": 25, "edge_protect": 0.10, "lightness_protect": 12},
         },
         "hard": {
-            TIER_SUBJECT:   {"min_area_pct": 0.00010, "similar_threshold": 4,  "edge_protect": 0.25},
-            TIER_SECONDARY: {"min_area_pct": 0.00025, "similar_threshold": 7,  "edge_protect": 0.18},
-            TIER_BG:        {"min_area_pct": 0.00120, "similar_threshold": 22, "edge_protect": 0.08},
+            TIER_SUBJECT:   {"min_area_pct": 0.00010, "similar_threshold": 4,  "edge_protect": 0.25, "lightness_protect": 3},
+            TIER_SECONDARY: {"min_area_pct": 0.00025, "similar_threshold": 7,  "edge_protect": 0.18, "lightness_protect": 5},
+            TIER_BG:        {"min_area_pct": 0.00120, "similar_threshold": 22, "edge_protect": 0.08, "lightness_protect": 10},
         },
         "expert": {
-            TIER_SUBJECT:   {"min_area_pct": 0.00005, "similar_threshold": 3,  "edge_protect": 0.22},
-            TIER_SECONDARY: {"min_area_pct": 0.00015, "similar_threshold": 5,  "edge_protect": 0.15},
-            TIER_BG:        {"min_area_pct": 0.00080, "similar_threshold": 18, "edge_protect": 0.06},
+            TIER_SUBJECT:   {"min_area_pct": 0.00005, "similar_threshold": 3,  "edge_protect": 0.22, "lightness_protect": 2},
+            TIER_SECONDARY: {"min_area_pct": 0.00015, "similar_threshold": 5,  "edge_protect": 0.15, "lightness_protect": 4},
+            TIER_BG:        {"min_area_pct": 0.00080, "similar_threshold": 18, "edge_protect": 0.06, "lightness_protect": 8},
         },
     }
     return params.get(difficulty, params["medium"])
@@ -544,15 +548,23 @@ def _merge_tiny(label_map, mean_colors, region_tiers, adjacency, areas,
             if region_color is None:
                 continue
 
-            # Prefer same-tier neighbor with closest color
+            # Prefer same-tier neighbor with closest color,
+            # weighted to also consider lightness similarity (preserve shading)
             region_tier = region_tiers.get(region_id, TIER_BG)
             same = [n for n in neighbors if region_tiers.get(n, TIER_BG) == region_tier and n in mean_colors]
             candidates = same if same else [n for n in neighbors if n in mean_colors]
             if not candidates:
                 continue
 
-            best_n = min(candidates,
-                         key=lambda n: np.sum((region_color - mean_colors[n]) ** 2))
+            # Score: LAB distance + extra weight on lightness difference
+            # This ensures tiny regions merge into neighbors with similar brightness
+            def merge_score(n):
+                nc = mean_colors[n]
+                lab_dist = np.sum((region_color - nc) ** 2)
+                L_diff = (float(region_color[0]) - float(nc[0])) ** 2
+                return lab_dist + L_diff  # L difference counted twice (once in lab_dist, once extra)
+
+            best_n = min(candidates, key=merge_score)
 
             _do_merge(label_map, best_n, region_id, mean_colors, region_tiers,
                       adjacency, areas, boundary_edges)
@@ -573,6 +585,7 @@ def _merge_by_tier(label_map, mean_colors, region_tiers, adjacency, areas,
     tp = tier_params.get(target_tier, tier_params[TIER_BG])
     threshold = tp["similar_threshold"]
     edge_protect = tp["edge_protect"]
+    lightness_protect = tp["lightness_protect"]
 
     for _ in range(30):
         if len(areas) <= target_stop:
@@ -598,6 +611,12 @@ def _merge_by_tier(label_map, mean_colors, region_tiers, adjacency, areas,
 
                 delta = np.sqrt(np.sum((color_a - color_b) ** 2))
                 if delta >= threshold:
+                    continue
+
+                # Lightness protection: don't merge if brightness differs
+                # even if overall color is similar (preserves shading/gradients)
+                delta_L = abs(float(color_a[0]) - float(color_b[0]))
+                if delta_L >= lightness_protect:
                     continue
 
                 # Edge protection check
