@@ -133,6 +133,13 @@ def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
     # Stage 8: Luminance balance check
     palette_lab = _ensure_luminance_balance(palette_lab, region_colors_lab, region_areas)
 
+    # Stage 8.5: Vibrancy boost - make colors more vivid and slightly brighter
+    # Commercial paint-by-numbers kits use boosted colors because:
+    #   - dried paint looks duller than wet
+    #   - brighter/more saturated colors are more enjoyable to paint
+    #   - this is art interpretation, not photo reproduction
+    palette_lab = _boost_vibrancy(palette_lab)
+
     n_final = len(palette_lab)
 
     # Stage 9: Sort by hue (chromatic first, then achromatic)
@@ -192,6 +199,43 @@ def _weighted_kmeans(colors: np.ndarray, weights: np.ndarray, k: int) -> np.ndar
     )
 
     return centers.astype(np.float64)
+
+
+def _boost_vibrancy(palette_lab: np.ndarray,
+                    saturation_boost: float = 1.25,
+                    brightness_boost: float = 1.08) -> np.ndarray:
+    """Boost palette saturation and brightness for a more vivid painting result.
+
+    Works in HSV space:
+      - Saturation: multiplied by saturation_boost (clamped to 255)
+      - Value (brightness): multiplied by brightness_boost (clamped to 255)
+
+    Neutrals (very low saturation) get only brightness boost, not saturation,
+    to keep whites/grays clean instead of tinting them.
+    """
+    # Convert LAB -> BGR -> HSV
+    lab_uint8 = np.clip(palette_lab, 0, 255).astype(np.uint8).reshape(1, -1, 3)
+    bgr = cv2.cvtColor(lab_uint8, cv2.COLOR_LAB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
+
+    for i in range(len(hsv)):
+        s = hsv[i, 1]
+        v = hsv[i, 2]
+
+        if s > 20:
+            # Chromatic: boost both saturation and brightness
+            hsv[i, 1] = min(255, s * saturation_boost)
+            hsv[i, 2] = min(255, v * brightness_boost)
+        else:
+            # Neutral: only brighten slightly, don't add color tint
+            hsv[i, 2] = min(255, v * brightness_boost)
+
+    # Convert back: HSV -> BGR -> LAB
+    hsv_uint8 = np.clip(hsv, 0, 255).astype(np.uint8).reshape(1, -1, 3)
+    bgr_out = cv2.cvtColor(hsv_uint8, cv2.COLOR_HSV2BGR)
+    lab_out = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float64)
+
+    return lab_out
 
 
 def _cv_lab_to_std(lab_cv):
