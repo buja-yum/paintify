@@ -11,6 +11,7 @@ Design principles (from 11_color_priority.md):
 
 import cv2
 import numpy as np
+from skimage.color import deltaE_ciede2000
 
 TIER_BG = 0
 TIER_SECONDARY = 1
@@ -126,8 +127,8 @@ def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
         palette_lab = _weighted_kmeans(region_colors_lab,
                                        weights * region_areas, n_colors)
 
-    # Stage 7: Deduplicate
-    palette_lab = _deduplicate_palette(palette_lab, min_delta=5.0)
+    # Stage 7: Deduplicate (CIEDE2000 ~3 = just noticeable difference)
+    palette_lab = _deduplicate_palette(palette_lab, min_delta=3.0)
 
     # Stage 8: Luminance balance check
     palette_lab = _ensure_luminance_balance(palette_lab, region_colors_lab, region_areas)
@@ -150,10 +151,19 @@ def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
     palette_lab = palette_lab[sort_order]
     palette_rgb = palette_rgb_arr[sort_order]
 
-    # Stage 10: Map each region to nearest palette color
+    # Stage 10: Map each region to nearest palette color (CIEDE2000)
+    # Batch convert palette to standard LAB for vectorized deltaE
+    palette_std = np.zeros((len(palette_lab), 3), dtype=np.float64)
+    palette_std[:, 0] = palette_lab[:, 0] * 100.0 / 255.0
+    palette_std[:, 1] = palette_lab[:, 1] - 128.0
+    palette_std[:, 2] = palette_lab[:, 2] - 128.0
+
     region_to_color = {}
     for i, (rid, rc) in enumerate(zip(region_ids, region_colors_lab)):
-        dists = np.sqrt(np.sum((palette_lab - rc.astype(np.float64)) ** 2, axis=1))
+        rc_std = np.array([[rc[0] * 100.0 / 255.0, rc[1] - 128.0, rc[2] - 128.0]])
+        # Broadcast: compare this region color against all palette colors
+        rc_broadcast = np.tile(rc_std, (len(palette_std), 1))
+        dists = deltaE_ciede2000(rc_broadcast, palette_std)
         best_idx = int(np.argmin(dists)) + 1
         region_to_color[rid] = best_idx
 
@@ -184,8 +194,22 @@ def _weighted_kmeans(colors: np.ndarray, weights: np.ndarray, k: int) -> np.ndar
     return centers.astype(np.float64)
 
 
+def _cv_lab_to_std(lab_cv):
+    """Convert OpenCV LAB (L:0-255, a:0-255, b:0-255) to standard LAB."""
+    return np.array([lab_cv[0] * 100.0 / 255.0,
+                     lab_cv[1] - 128.0,
+                     lab_cv[2] - 128.0])
+
+
+def _ciede2000_pair(lab_cv_a, lab_cv_b):
+    """CIEDE2000 distance between two OpenCV LAB colors."""
+    a = _cv_lab_to_std(lab_cv_a).reshape(1, 3)
+    b = _cv_lab_to_std(lab_cv_b).reshape(1, 3)
+    return float(deltaE_ciede2000(a, b)[0])
+
+
 def _deduplicate_palette(palette_lab: np.ndarray, min_delta: float) -> np.ndarray:
-    """Remove near-duplicate palette colors (perceptually too similar in LAB)."""
+    """Remove near-duplicate palette colors using CIEDE2000 perceptual distance."""
     keep = list(range(len(palette_lab)))
 
     while True:
@@ -195,7 +219,7 @@ def _deduplicate_palette(palette_lab: np.ndarray, min_delta: float) -> np.ndarra
             for j in range(i + 1, n):
                 ci = palette_lab[keep[i]]
                 cj = palette_lab[keep[j]]
-                delta = np.sqrt(np.sum((ci - cj) ** 2))
+                delta = _ciede2000_pair(ci, cj)
                 if delta < min_delta:
                     palette_lab[keep[i]] = (ci + cj) / 2
                     keep.pop(j)

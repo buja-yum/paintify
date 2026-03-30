@@ -16,6 +16,7 @@ Performance: uses vectorized adjacency graph and bincount for O(pixels) merging.
 import cv2
 import numpy as np
 from skimage.segmentation import slic
+from skimage.color import deltaE_ciede2000
 
 TIER_BG = 0
 TIER_SECONDARY = 1
@@ -134,44 +135,50 @@ def segment_image(image_bgr: np.ndarray, n_segments: int, difficulty: str) -> np
 # =============================================================================
 
 def _compute_semantic_tiers(image_bgr, image_lab):
+    """Build 3-tier map using rembg (U2-Net) for precise subject detection,
+    with edge density for secondary region identification.
+
+    Falls back to saliency + GrabCut if rembg is unavailable.
+    """
     h, w = image_bgr.shape[:2]
 
-    saliency_sr = cv2.saliency.StaticSaliencySpectralResidual_create()
-    ok, sal_sr = saliency_sr.computeSaliency(image_bgr)
-    sal_sr = (sal_sr * 255).astype(np.uint8) if ok else np.zeros((h, w), np.uint8)
+    # --- Primary subject detection via rembg (deep learning) ---
+    subject_mask = _rembg_subject_mask(image_bgr)
 
-    saliency_fg = cv2.saliency.StaticSaliencyFineGrained_create()
-    ok2, sal_fg = saliency_fg.computeSaliency(image_bgr)
-    sal_fg = (sal_fg * 255).astype(np.uint8) if ok2 else np.zeros((h, w), np.uint8)
+    if subject_mask is None:
+        # Fallback to legacy saliency + GrabCut
+        print("      rembg unavailable, falling back to saliency+GrabCut...")
+        subject_mask = _legacy_subject_mask(image_bgr, image_lab)
 
-    saliency = cv2.addWeighted(sal_sr, 0.4, sal_fg, 0.6, 0)
-    saliency = cv2.GaussianBlur(saliency, (31, 31), 0)
-
+    # --- Edge density for secondary region detection ---
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     edge_density = cv2.GaussianBlur(edges.astype(np.float32), (51, 51), 0)
     edge_density = (edge_density / (edge_density.max() + 1e-8) * 255).astype(np.uint8)
 
+    # Color distance from mean for secondary detection
     mean_color = image_lab.mean(axis=(0, 1)).astype(np.float32)
     diff = image_lab.astype(np.float32) - mean_color
     color_dist = np.sqrt(np.sum(diff ** 2, axis=2))
     color_dist = (color_dist / (color_dist.max() + 1e-8) * 255).astype(np.uint8)
     color_dist = cv2.GaussianBlur(color_dist, (31, 31), 0)
 
-    combined = (saliency.astype(np.float32) * 0.45 +
-                edge_density.astype(np.float32) * 0.25 +
-                color_dist.astype(np.float32) * 0.30)
-    combined = (combined / (combined.max() + 1e-8) * 255).astype(np.uint8)
+    # Secondary score: areas with moderate edge density or color distinctiveness
+    secondary_score = (edge_density.astype(np.float32) * 0.4 +
+                       color_dist.astype(np.float32) * 0.6)
+    secondary_score = (secondary_score / (secondary_score.max() + 1e-8) * 255).astype(np.uint8)
 
-    subject_mask = _grabcut_refine(image_bgr, combined)
-
+    # --- Build 3-tier map ---
     tier_map = np.full((h, w), TIER_BG, dtype=np.uint8)
-    p40 = np.percentile(combined, 40)
-    p70 = np.percentile(combined, 70)
-    tier_map[combined > p40] = TIER_SECONDARY
-    tier_map[combined > p70] = TIER_SUBJECT
-    tier_map[subject_mask > 0] = np.maximum(tier_map[subject_mask > 0], TIER_SUBJECT)
 
+    # Secondary: moderate score and NOT already subject
+    p50 = np.percentile(secondary_score, 50)
+    tier_map[secondary_score > p50] = TIER_SECONDARY
+
+    # Subject: from rembg mask (overrides secondary)
+    tier_map[subject_mask > 0] = TIER_SUBJECT
+
+    # Morphological cleanup
     kernel_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     kernel_lg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
 
@@ -189,10 +196,48 @@ def _compute_semantic_tiers(image_bgr, image_lab):
     return tier_map
 
 
-def _grabcut_refine(image_bgr, saliency):
-    h, w = image_bgr.shape[:2]
-    gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+def _rembg_subject_mask(image_bgr):
+    """Use rembg (U2-Net) for accurate foreground/background separation."""
+    try:
+        from rembg import remove, new_session
+        from PIL import Image as PILImage
+    except ImportError:
+        return None
 
+    try:
+        # Convert BGR to RGB PIL image
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = PILImage.fromarray(image_rgb)
+
+        # rembg returns RGBA with alpha = foreground mask
+        result = remove(pil_img, only_mask=True)
+        mask = np.array(result)
+
+        # Threshold the soft mask to binary
+        _, binary_mask = cv2.threshold(mask, 127, 1, cv2.THRESH_BINARY)
+        return binary_mask.astype(np.uint8)
+    except Exception as e:
+        print(f"      rembg failed ({e}), falling back...")
+        return None
+
+
+def _legacy_subject_mask(image_bgr, image_lab):
+    """Fallback: saliency + GrabCut for subject detection."""
+    h, w = image_bgr.shape[:2]
+
+    saliency_sr = cv2.saliency.StaticSaliencySpectralResidual_create()
+    ok, sal_sr = saliency_sr.computeSaliency(image_bgr)
+    sal_sr = (sal_sr * 255).astype(np.uint8) if ok else np.zeros((h, w), np.uint8)
+
+    saliency_fg = cv2.saliency.StaticSaliencyFineGrained_create()
+    ok2, sal_fg = saliency_fg.computeSaliency(image_bgr)
+    sal_fg = (sal_fg * 255).astype(np.uint8) if ok2 else np.zeros((h, w), np.uint8)
+
+    saliency = cv2.addWeighted(sal_sr, 0.4, sal_fg, 0.6, 0)
+    saliency = cv2.GaussianBlur(saliency, (31, 31), 0)
+
+    # GrabCut refinement
+    gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
     high = np.percentile(saliency, 80)
     low = np.percentile(saliency, 20)
     gc_mask[saliency > high] = cv2.GC_PR_FGD
@@ -421,6 +466,22 @@ def _compute_boundary_edges(label_map, edge_strength):
     return boundary_edges
 
 
+def _ciede2000(lab_cv_a, lab_cv_b):
+    """Compute CIEDE2000 perceptual color distance between two OpenCV LAB colors.
+
+    OpenCV LAB: L=0-255, a=0-255, b=0-255
+    scikit-image expects: L=0-100, a=-128..127, b=-128..127
+    """
+    # Convert OpenCV LAB to standard LAB
+    lab_a = np.array([[lab_cv_a[0] * 100.0 / 255.0,
+                       lab_cv_a[1] - 128.0,
+                       lab_cv_a[2] - 128.0]])
+    lab_b = np.array([[lab_cv_b[0] * 100.0 / 255.0,
+                       lab_cv_b[1] - 128.0,
+                       lab_cv_b[2] - 128.0]])
+    return float(deltaE_ciede2000(lab_a, lab_b)[0])
+
+
 def _classify_regions(label_map, tier_map):
     region_tiers = {}
     for lab in np.unique(label_map):
@@ -434,32 +495,31 @@ def _get_tier_params(difficulty):
     """Per-tier merge parameters.
 
     Key design:
-      - background: high similar_threshold for aggressive simplification
+      - similar_threshold is now CIEDE2000 scale (~2=identical, ~5=noticeable, ~10=obvious)
+      - background: high threshold for aggressive simplification
       - subject: very low threshold to preserve detail
-      - lightness_protect: minimum L-channel difference that blocks merging,
-        even if overall LAB distance is below threshold. This preserves
-        highlight/midtone/shadow transitions within same-hue areas (e.g. white fur).
+      - lightness_protect: minimum L-channel difference that blocks merging
     """
     params = {
         "easy": {
-            TIER_SUBJECT:   {"min_area_pct": 0.0005, "similar_threshold": 8,  "edge_protect": 0.30, "lightness_protect": 6},
-            TIER_SECONDARY: {"min_area_pct": 0.0010, "similar_threshold": 14, "edge_protect": 0.22, "lightness_protect": 8},
-            TIER_BG:        {"min_area_pct": 0.0025, "similar_threshold": 30, "edge_protect": 0.12, "lightness_protect": 15},
+            TIER_SUBJECT:   {"min_area_pct": 0.0005, "similar_threshold": 5,  "edge_protect": 0.30, "lightness_protect": 6},
+            TIER_SECONDARY: {"min_area_pct": 0.0010, "similar_threshold": 8,  "edge_protect": 0.22, "lightness_protect": 8},
+            TIER_BG:        {"min_area_pct": 0.0025, "similar_threshold": 15, "edge_protect": 0.12, "lightness_protect": 15},
         },
         "medium": {
-            TIER_SUBJECT:   {"min_area_pct": 0.0003, "similar_threshold": 6,  "edge_protect": 0.28, "lightness_protect": 4},
-            TIER_SECONDARY: {"min_area_pct": 0.0006, "similar_threshold": 10, "edge_protect": 0.20, "lightness_protect": 6},
-            TIER_BG:        {"min_area_pct": 0.0018, "similar_threshold": 25, "edge_protect": 0.10, "lightness_protect": 12},
+            TIER_SUBJECT:   {"min_area_pct": 0.0003, "similar_threshold": 4,  "edge_protect": 0.28, "lightness_protect": 4},
+            TIER_SECONDARY: {"min_area_pct": 0.0006, "similar_threshold": 6,  "edge_protect": 0.20, "lightness_protect": 6},
+            TIER_BG:        {"min_area_pct": 0.0018, "similar_threshold": 12, "edge_protect": 0.10, "lightness_protect": 12},
         },
         "hard": {
-            TIER_SUBJECT:   {"min_area_pct": 0.00010, "similar_threshold": 4,  "edge_protect": 0.25, "lightness_protect": 3},
-            TIER_SECONDARY: {"min_area_pct": 0.00025, "similar_threshold": 7,  "edge_protect": 0.18, "lightness_protect": 5},
-            TIER_BG:        {"min_area_pct": 0.00120, "similar_threshold": 22, "edge_protect": 0.08, "lightness_protect": 10},
+            TIER_SUBJECT:   {"min_area_pct": 0.00010, "similar_threshold": 3,  "edge_protect": 0.25, "lightness_protect": 3},
+            TIER_SECONDARY: {"min_area_pct": 0.00025, "similar_threshold": 5,  "edge_protect": 0.18, "lightness_protect": 5},
+            TIER_BG:        {"min_area_pct": 0.00120, "similar_threshold": 10, "edge_protect": 0.08, "lightness_protect": 10},
         },
         "expert": {
-            TIER_SUBJECT:   {"min_area_pct": 0.00005, "similar_threshold": 3,  "edge_protect": 0.22, "lightness_protect": 2},
-            TIER_SECONDARY: {"min_area_pct": 0.00015, "similar_threshold": 5,  "edge_protect": 0.15, "lightness_protect": 4},
-            TIER_BG:        {"min_area_pct": 0.00080, "similar_threshold": 18, "edge_protect": 0.06, "lightness_protect": 8},
+            TIER_SUBJECT:   {"min_area_pct": 0.00005, "similar_threshold": 2,  "edge_protect": 0.22, "lightness_protect": 2},
+            TIER_SECONDARY: {"min_area_pct": 0.00015, "similar_threshold": 4,  "edge_protect": 0.15, "lightness_protect": 4},
+            TIER_BG:        {"min_area_pct": 0.00080, "similar_threshold": 8,  "edge_protect": 0.06, "lightness_protect": 8},
         },
     }
     return params.get(difficulty, params["medium"])
@@ -568,15 +628,9 @@ def _merge_tiny(label_map, mean_colors, region_tiers, adjacency, areas,
             if not candidates:
                 continue
 
-            # Score: LAB distance + extra weight on lightness difference
-            # This ensures tiny regions merge into neighbors with similar brightness
-            def merge_score(n):
-                nc = mean_colors[n]
-                lab_dist = np.sum((region_color - nc) ** 2)
-                L_diff = (float(region_color[0]) - float(nc[0])) ** 2
-                return lab_dist + L_diff  # L difference counted twice (once in lab_dist, once extra)
-
-            best_n = min(candidates, key=merge_score)
+            # Use Euclidean LAB for fast neighbor selection (close enough for tiny merges)
+            best_n = min(candidates,
+                         key=lambda n: np.sum((region_color - mean_colors[n]) ** 2))
 
             _do_merge(label_map, best_n, region_id, mean_colors, region_tiers,
                       adjacency, areas, boundary_edges)
@@ -621,7 +675,14 @@ def _merge_by_tier(label_map, mean_colors, region_tiers, adjacency, areas,
                 if color_b is None:
                     continue
 
-                delta = np.sqrt(np.sum((color_a - color_b) ** 2))
+                # Fast pre-filter with Euclidean LAB (avoids expensive CIEDE2000
+                # for obviously dissimilar pairs). CIEDE2000 threshold * 3 as cutoff.
+                euclidean_fast = np.sqrt(np.sum((color_a - color_b) ** 2))
+                if euclidean_fast >= threshold * 3:
+                    continue
+
+                # CIEDE2000 perceptual color distance (accurate)
+                delta = _ciede2000(color_a, color_b)
                 if delta >= threshold:
                     continue
 
