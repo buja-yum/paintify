@@ -20,11 +20,12 @@ TIER_SUBJECT = 2
 # Neutral = low saturation in HSV
 NEUTRAL_SAT_THRESHOLD = 35
 # Max percentage of palette that neutrals can occupy
-NEUTRAL_MAX_RATIO = 0.35
+NEUTRAL_MAX_RATIO = 0.25
 
 
 def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
-                    n_colors: int, region_tiers: dict = None) -> tuple:
+                    n_colors: int, region_tiers: dict = None,
+                    vibrancy: float = 1.3) -> tuple:
     """Extract a semantically-prioritized color palette.
 
     Returns:
@@ -48,8 +49,19 @@ def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
 
     for lab in unique_labels:
         mask = flat_labels == lab
-        region_colors_lab.append(flat_lab[mask].mean(axis=0))
-        region_colors_hsv.append(flat_hsv[mask].mean(axis=0))
+        pixels_lab = flat_lab[mask]
+        pixels_hsv = flat_hsv[mask]
+
+        # Saturation-weighted color: vivid pixels contribute more to the
+        # representative color, preventing dull averaging
+        sat_weights = pixels_hsv[:, 1]  # S channel as weight
+        sat_weights = sat_weights + 10  # floor so unsaturated regions still work
+        sw_sum = sat_weights.sum()
+        weighted_lab = (pixels_lab * sat_weights[:, np.newaxis]).sum(axis=0) / sw_sum
+        weighted_hsv = (pixels_hsv * sat_weights[:, np.newaxis]).sum(axis=0) / sw_sum
+
+        region_colors_lab.append(weighted_lab)
+        region_colors_hsv.append(weighted_hsv)
         region_areas.append(int(mask.sum()))
         region_ids.append(lab)
 
@@ -134,11 +146,9 @@ def extract_palette(image_bgr: np.ndarray, label_map: np.ndarray,
     palette_lab = _ensure_luminance_balance(palette_lab, region_colors_lab, region_areas)
 
     # Stage 8.5: Vibrancy boost - make colors more vivid and slightly brighter
-    # Commercial paint-by-numbers kits use boosted colors because:
-    #   - dried paint looks duller than wet
-    #   - brighter/more saturated colors are more enjoyable to paint
-    #   - this is art interpretation, not photo reproduction
-    palette_lab = _boost_vibrancy(palette_lab)
+    palette_lab = _boost_vibrancy(palette_lab,
+                                  saturation_boost=1.0 + 0.3 * vibrancy,
+                                  brightness_boost=1.0 + 0.08 * vibrancy)
 
     n_final = len(palette_lab)
 

@@ -49,6 +49,8 @@ def parse_args():
     parser.add_argument("--paper-size", default="a4",
                         choices=["letter", "a4", "a3"],
                         help="Paper size for PDF output (default: a4)")
+    parser.add_argument("--vibrancy", type=float, default=1.3,
+                        help="Color vibrancy boost 0.0=original, 1.0=moderate, 2.0=very vivid (default: 1.3)")
     return parser.parse_args()
 
 
@@ -203,7 +205,7 @@ def main():
 
     # Step 3: Extract palette
     print("[3/4] Extracting color palette...")
-    palette_rgb, region_to_color, _ = extract_palette(image, label_map, colors, region_tiers)
+    palette_rgb, region_to_color, _ = extract_palette(image, label_map, colors, region_tiers, args.vibrancy)
     print(f"  Palette: {len(palette_rgb)} colors")
 
     # Step 4: Render outputs
