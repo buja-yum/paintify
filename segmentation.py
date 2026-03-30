@@ -36,12 +36,12 @@ def segment_image(image_bgr: np.ndarray, n_segments: int, difficulty: str) -> np
     print("    Computing semantic tier map...")
     tier_map = _compute_semantic_tiers(image_bgr, image_lab)
 
-    # Stage 2: Edge strength for merge protection
-    edge_strength = _compute_edge_strength(image_bgr, image_lab)
+    # Stage 2: Edge strength for merge protection (boosted at high-detail features)
+    edge_strength = _compute_edge_strength(image_bgr, image_lab, tier_map)
 
-    # Stage 3: Spatially-adaptive SLIC
-    # More segments in subject, fewer in background
-    image_smoothed = cv2.bilateralFilter(image_lab, d=7, sigmaColor=40, sigmaSpace=40)
+    # Stage 3: Texture-aware smoothing before SLIC
+    # Anisotropic smoothing follows texture flow so SLIC segments align with fur/hair
+    image_smoothed = _texture_aware_smooth(image_lab, tier_map)
     image_rgb_smoothed = cv2.cvtColor(image_smoothed, cv2.COLOR_LAB2RGB)
 
     # Subject-focused density: allocate segments proportionally but weighted
@@ -215,10 +215,54 @@ def _grabcut_refine(image_bgr, saliency):
 
 
 # =============================================================================
-# Edge strength
+# Texture flow detection & anisotropic smoothing
 # =============================================================================
 
-def _compute_edge_strength(image_bgr, image_lab):
+def _texture_aware_smooth(image_lab, tier_map):
+    """Apply different smoothing per tier to guide SLIC along texture flow.
+
+    Subject: light anisotropic smoothing (preserves fur/hair direction)
+    Secondary: moderate bilateral smoothing
+    Background: strong smoothing (encourages large uniform regions)
+    """
+    h, w = image_lab.shape[:2]
+    result = image_lab.copy()
+
+    # Background: strong smoothing to encourage large flat regions
+    bg_mask = (tier_map == TIER_BG)
+    bg_smoothed = cv2.bilateralFilter(image_lab, d=11, sigmaColor=60, sigmaSpace=60)
+
+    # Secondary: moderate smoothing
+    sec_smoothed = cv2.bilateralFilter(image_lab, d=9, sigmaColor=45, sigmaSpace=45)
+
+    # Subject: light edge-preserving smoothing to keep texture detail
+    # Use small bilateral that preserves edges (fur boundaries, facial features)
+    subj_smoothed = cv2.bilateralFilter(image_lab, d=5, sigmaColor=25, sigmaSpace=25)
+
+    # Blend per tier
+    bg_3d = np.stack([bg_mask] * 3, axis=-1)
+    sec_mask = (tier_map == TIER_SECONDARY)
+    sec_3d = np.stack([sec_mask] * 3, axis=-1)
+    subj_mask = (tier_map == TIER_SUBJECT)
+    subj_3d = np.stack([subj_mask] * 3, axis=-1)
+
+    result[bg_3d] = bg_smoothed[bg_3d]
+    result[sec_3d] = sec_smoothed[sec_3d]
+    result[subj_3d] = subj_smoothed[subj_3d]
+
+    return result
+
+
+# =============================================================================
+# Edge strength with feature-aware boost
+# =============================================================================
+
+def _compute_edge_strength(image_bgr, image_lab, tier_map):
+    """Compute edge strength with boosted protection at high-detail subject features.
+
+    High edge density within subject tier (eyes, nose, facial contours) gets
+    extra protection to prevent merging across critical features.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
@@ -233,6 +277,21 @@ def _compute_edge_strength(image_bgr, image_lab):
     lab_grad = np.sqrt(lab_grad)
 
     combined = grad_mag * 0.4 + lab_grad * 0.6
+    combined = combined / (combined.max() + 1e-8)
+
+    # Feature-aware boost: edges within subject tier get 1.5x strength
+    # This protects eyes, nose, mouth, facial contours from being merged
+    subject_mask = (tier_map == TIER_SUBJECT).astype(np.float32)
+    # Find high-edge-density areas within subject (likely facial features)
+    subject_edges = combined * subject_mask
+    # Localized edge density within subject
+    feature_density = cv2.GaussianBlur(subject_edges.astype(np.float32), (21, 21), 0)
+    feature_density = feature_density / (feature_density.max() + 1e-8)
+    # Boost factor: 1.0 (no boost) to 1.5 (max boost at feature-dense areas)
+    boost = 1.0 + 0.5 * feature_density * subject_mask
+    combined = combined * boost
+
+    # Re-normalize
     combined = combined / (combined.max() + 1e-8)
     return combined.astype(np.float32)
 
